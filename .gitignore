@@ -1,0 +1,5 @@
+data/forecaster.db
+data/*.db
+__pycache__/
+*.pyc
+.pytest_cache/
