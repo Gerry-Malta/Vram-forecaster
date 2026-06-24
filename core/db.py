@@ -304,6 +304,58 @@ def finalize_run(
     update_run(record, db_path)
 
 
+def reap_stale_runs(
+    gpu_model: Optional[str] = None,
+    stale_after_seconds: float = 6 * 3600,
+    error_message: str = "did not complete (crash or OOM — never reached logger_end)",
+    db_path: Path = _DEFAULT_DB_PATH,
+) -> int:
+    """Mark abandoned 'running' rows as failed and return how many were reaped.
+
+    A run that OOMs or crashes never reaches logger_end, so its row is left
+    stuck at outcome='running'.  These are the most valuable negative data
+    points (they tell the model where the ceiling is), so instead of deleting
+    them we reclassify them as 'error'.
+
+    Only rows older than `stale_after_seconds` are touched, so a genuinely
+    in-progress run on another GPU/process is never clobbered.  When
+    `gpu_model` is given, only that device's stale rows are reaped — important
+    for the dual-GPU work machine where two ComfyUI instances may run at once.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - stale_after_seconds
+
+    clauses = ["outcome = 'running'"]
+    params: list[Any] = []
+    if gpu_model:
+        clauses.append("gpu_model = ?")
+        params.append(gpu_model)
+    where = " AND ".join(clauses)
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT id, started_at FROM runs WHERE {where}", params
+        ).fetchall()
+
+        stale_ids = []
+        for row in rows:
+            try:
+                started = datetime.fromisoformat(row["started_at"]).timestamp()
+            except Exception:
+                # Unparseable timestamp — treat as stale to avoid orphans
+                started = 0
+            if started <= cutoff:
+                stale_ids.append(row["id"])
+
+        for rid in stale_ids:
+            conn.execute(
+                "UPDATE runs SET outcome = 'error', error_message = ?, ended_at = ? "
+                "WHERE id = ?",
+                (error_message, _now_iso(), rid),
+            )
+
+    return len(stale_ids)
+
+
 def get_run(run_id: int, db_path: Path = _DEFAULT_DB_PATH) -> Optional[RunRecord]:
     """Fetch a single run by id, or None if not found."""
     with _connect(db_path) as conn:
